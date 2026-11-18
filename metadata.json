@@ -1,0 +1,8 @@
+{
+  "name": "Digital Automation Pulse",
+  "description": "Your website's digital health, decoded — AI-powered SEO, technical, content, keyword, and AI-search readiness audit platform.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
