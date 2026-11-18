@@ -2,15 +2,15 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import type { AuditReport } from './src/types/audit.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 3000);
-const MODEL_AUDIT = 'gemini-2.5-pro';
-const MODEL_LIGHT = 'gemini-2.5-flash';
+const MODEL_AUDIT = 'gemini-4-hydrogen';
+const MODEL_LIGHT = 'gemini-4-hydrogen';
 
 function getGenAIClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -630,6 +630,212 @@ function classifyGeminiError(err: unknown): { status: number; code: string; mess
   };
 }
 
+interface SiteSnapshot {
+  finalUrl: string;
+  httpStatus: number;
+  redirected: boolean;
+  securityHeaders: Record<string, string | null>;
+  robotsTxtStatus: string;
+  robotsTxtSnippet: string;
+  sitemapStatus: string;
+  title: string;
+  metaDescription: string;
+  metaRobots: string;
+  canonical: string;
+  viewport: string;
+  hreflangs: string[];
+  jsonLdTypes: string[];
+  headings: { h1: string[]; h2: string[]; h3: string[] };
+  imageStats: { total: number; missingAlt: number };
+  linkStats: { internal: number; external: number };
+  textExcerpt: string;
+}
+
+async function fetchWithTimeout(url: string, timeoutMs = 8000): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; DigitalAutomationPulse/1.0)',
+        Accept: 'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8',
+      },
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function stripHtmlTags(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function fetchServerSideSiteSnapshot(targetUrl: string): Promise<SiteSnapshot> {
+  const res = await fetchWithTimeout(targetUrl, 9000);
+  if (!res.ok && res.status >= 400) {
+    throw Object.assign(new Error(`Target website returned HTTP ${res.status} (${res.statusText}).`), {
+      errorCode: 'UNREACHABLE',
+      statusCode: 422,
+    });
+  }
+  const html = await res.text();
+  const origin = new URL(res.url || targetUrl).origin;
+
+  let robotsTxtStatus = 'Not verifiable';
+  let robotsTxtSnippet = '';
+  try {
+    const rRes = await fetchWithTimeout(`${origin}/robots.txt`, 4000);
+    robotsTxtStatus = `HTTP ${rRes.status}`;
+    if (rRes.ok) {
+      robotsTxtSnippet = (await rRes.text()).slice(0, 800);
+    }
+  } catch {
+    robotsTxtStatus = 'Unreachable / Timeout';
+  }
+
+  let sitemapStatus = 'Not verifiable';
+  try {
+    const sRes = await fetchWithTimeout(`${origin}/sitemap.xml`, 4000);
+    sitemapStatus = `HTTP ${sRes.status}`;
+  } catch {
+    sitemapStatus = 'Unreachable / Timeout';
+  }
+
+  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const title = titleMatch ? stripHtmlTags(titleMatch[1]).slice(0, 200) : 'Missing';
+
+  const getMeta = (name: string) => {
+    const re = new RegExp(`<meta[^>]+(?:name|property)=["']${name}["'][^>]*content=["']([^"']*)["'][^>]*>`, 'i');
+    const reRev = new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]*(?:name|property)=["']${name}["'][^>]*>`, 'i');
+    return (html.match(re)?.[1] || html.match(reRev)?.[1] || '').trim();
+  };
+
+  const canonical =
+    html.match(/<link[^>]+rel=["']canonical["'][^>]*href=["']([^"']*)["'][^>]*>/i)?.[1]?.trim() ||
+    html.match(/<link[^>]+href=["']([^"']*)["'][^>]*rel=["']canonical["'][^>]*>/i)?.[1]?.trim() ||
+    'Not detected';
+
+  const hreflangs = Array.from(
+    html.matchAll(/<link[^>]+rel=["']alternate["'][^>]*hreflang=["']([^"']+)["'][^>]*>/gi)
+  ).map((m) => m[1]);
+
+  const jsonLdTypes: string[] = [];
+  for (const match of html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+    try {
+      const parsed = JSON.parse(match[1]) as { '@type'?: string | string[] };
+      if (parsed?.['@type']) {
+        const types = Array.isArray(parsed['@type']) ? parsed['@type'] : [parsed['@type']];
+        jsonLdTypes.push(...types.map(String));
+      }
+    } catch {
+      jsonLdTypes.push('Unparsed JSON-LD');
+    }
+  }
+
+  const extractHeadings = (tag: string) =>
+    Array.from(html.matchAll(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'gi')))
+      .map((m) => stripHtmlTags(m[1]))
+      .filter(Boolean)
+      .slice(0, 12);
+
+  const imgTags = Array.from(html.matchAll(/<img\b[^>]*>/gi)).map((m) => m[0]);
+  const missingAlt = imgTags.filter((tag) => {
+    const altMatch = tag.match(/\balt=["']([^"']*)["']/i);
+    return !altMatch || altMatch[1].trim() === '';
+  }).length;
+
+  const anchorTags = Array.from(html.matchAll(/<a\b[^>]*href=["']([^"']+)["'][^>]*>/gi)).map((m) => m[1]);
+  let internalLinks = 0;
+  let externalLinks = 0;
+  const host = new URL(res.url || targetUrl).hostname;
+  for (const href of anchorTags) {
+    if (href.startsWith('/') || href.startsWith('#')) {
+      internalLinks++;
+    } else if (/^https?:\/\//i.test(href)) {
+      try {
+        if (new URL(href).hostname === host) internalLinks++;
+        else externalLinks++;
+      } catch {
+        // ignore invalid href
+      }
+    }
+  }
+
+  return {
+    finalUrl: res.url || targetUrl,
+    httpStatus: res.status,
+    redirected: res.redirected,
+    securityHeaders: {
+      'strict-transport-security': res.headers.get('strict-transport-security'),
+      'content-security-policy': res.headers.get('content-security-policy'),
+      'x-frame-options': res.headers.get('x-frame-options'),
+      'x-content-type-options': res.headers.get('x-content-type-options'),
+    },
+    robotsTxtStatus,
+    robotsTxtSnippet,
+    sitemapStatus,
+    title,
+    metaDescription: getMeta('description') || 'Missing',
+    metaRobots: getMeta('robots') || 'Not specified (defaults to index, follow)',
+    canonical,
+    viewport: getMeta('viewport') || 'Missing',
+    hreflangs,
+    jsonLdTypes,
+    headings: {
+      h1: extractHeadings('h1'),
+      h2: extractHeadings('h2'),
+      h3: extractHeadings('h3'),
+    },
+    imageStats: { total: imgTags.length, missingAlt },
+    linkStats: { internal: internalLinks, external: externalLinks },
+    textExcerpt: stripHtmlTags(html).slice(0, 5500),
+  };
+}
+
+function isQuotaOrModelUnavailable(err: unknown): boolean {
+  const e = err as { status?: number; statusCode?: number; message?: string };
+  const status = e?.status || e?.statusCode;
+  const msg = String(e?.message || '').toLowerCase();
+  return (
+    status === 429 ||
+    status === 404 ||
+    status === 503 ||
+    status === 502 ||
+    msg.includes('resource_exhausted') ||
+    msg.includes('quota') ||
+    msg.includes('not_found') ||
+    msg.includes('no longer available') ||
+    msg.includes('unavailable') ||
+    msg.includes('high demand') ||
+    msg.includes('overloaded')
+  );
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isCombinedToolSchemaError(err: unknown): boolean {
+  const e = err as { status?: number; message?: string };
+  const msg = String(e?.message || '').toLowerCase();
+  return (
+    e?.status === 400 ||
+    msg.includes('controlled generation') ||
+    msg.includes('response_mime_type') ||
+    msg.includes('response_schema') ||
+    msg.includes('tool use with') ||
+    msg.includes('invalid_argument')
+  );
+}
+
 async function runStructuredGroundedAudit(
   ai: GoogleGenAI,
   targetUrl: string,
@@ -649,25 +855,25 @@ Use the URL Context tool to read the live target page (and competitor page if pr
 Return ONLY valid JSON matching the exact schema. Mark any item you cannot directly verify from the live page or search grounding as "Not verifiable" instead of fabricating numbers.`;
 
   let groundingSources: { title: string; uri: string }[] = [];
-  let rawParsed: Record<string, unknown> | null = null;
 
-  // Attempt 1: Single-pass grounded + structured output on gemini-2.5-pro
-  // Fallback if API disallows combining tools + responseSchema in one request:
-  // Stage A (grounded URL Context + Search) -> Stage B (structured JSON synthesis).
-  const executeSingleOrTwoStage = async () => {
-    emitStage('reading', `Reading live page content for ${targetUrl}...`);
+  const runWithTools = async (
+    model: string,
+    tools: Array<{ urlContext?: Record<string, never>; googleSearch?: Record<string, never> }>,
+    useThinking: boolean
+  ) => {
+    const thinkingCfg = useThinking ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } } : {};
     try {
       const response = await ai.models.generateContent({
-        model: MODEL_AUDIT,
+        model,
         contents: auditPrompt,
         config: {
           systemInstruction: AUDIT_SYSTEM_INSTRUCTION,
-          tools: [{ urlContext: {} }, { googleSearch: {} }],
+          ...thinkingCfg,
+          tools,
           responseMimeType: 'application/json',
           responseSchema: auditResponseSchema,
         },
       });
-
       const retrievalStatus = extractUrlRetrievalStatus(response);
       if (retrievalStatus && retrievalStatus.includes('ERROR') && !response.text) {
         throw Object.assign(new Error(`Target URL retrieval failed (${retrievalStatus}).`), {
@@ -675,30 +881,16 @@ Return ONLY valid JSON matching the exact schema. Mark any item you cannot direc
           statusCode: 422,
         });
       }
-
       groundingSources = extractGroundingSources(response);
       emitStage('building', 'Validating structured audit data...');
       return parseJsonSafely(response.text);
     } catch (err) {
-      const msg = String((err as Error)?.message || '').toLowerCase();
-      const isCombinedToolSchemaUnsupported =
-        msg.includes('controlled generation') ||
-        msg.includes('response_mime_type') ||
-        msg.includes('response_schema') ||
-        msg.includes('tool use with') ||
-        msg.includes('invalid_argument') ||
-        (err as { status?: number })?.status === 400;
+      if (!isCombinedToolSchemaError(err)) throw err;
 
-      if (!isCombinedToolSchemaUnsupported) {
-        throw err;
-      }
-
-      // Two-stage grounded pipeline:
-      // Stage A: Gather live URL context + Google Search grounding dossier with gemini-2.5-pro
-      emitStage('seo', 'Gathering live URL context & Google Search grounding signals...');
+      emitStage('seo', 'Gathering live URL context & search grounding signals...');
       const researchResponse = await ai.models.generateContent({
-        model: MODEL_AUDIT,
-        contents: `Inspect ${targetUrl} using URL Context and search signals for market "${targetCountry || 'Global'}"${
+        model,
+        contents: `Inspect ${targetUrl} using available tools for market "${targetCountry || 'Global'}"${
           competitorUrl ? ` (with competitor context ${competitorUrl})` : ''
         }. Document EVERY observable detail accurately for:
 1. Business & value proposition summary
@@ -710,7 +902,8 @@ Return ONLY valid JSON matching the exact schema. Mark any item you cannot direc
 Explicitly label anything not directly observable as "Not verifiable".`,
         config: {
           systemInstruction: AUDIT_SYSTEM_INSTRUCTION,
-          tools: [{ urlContext: {} }, { googleSearch: {} }],
+          ...thinkingCfg,
+          tools,
         },
       });
 
@@ -726,14 +919,14 @@ Explicitly label anything not directly observable as "Not verifiable".`,
       groundingSources = extractGroundingSources(researchResponse);
       emitStage('building', 'Synthesizing structured audit report...');
 
-      // Stage B: Convert grounded evidence dossier into strict structured JSON
       const structuredResponse = await ai.models.generateContent({
-        model: MODEL_AUDIT,
+        model,
         contents: `Convert the following verified audit dossier for ${targetUrl} (Target Country: ${
           targetCountry || 'Global'
         }, Date: ${today}) into the exact required JSON audit report. Preserve all "Not verifiable" markings faithfully and never fabricate unverified metrics.\n\nDOSSIER:\n${dossier}`,
         config: {
           systemInstruction: AUDIT_SYSTEM_INSTRUCTION,
+          ...(useThinking ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } } : {}),
           responseMimeType: 'application/json',
           responseSchema: auditResponseSchema,
         },
@@ -743,13 +936,83 @@ Explicitly label anything not directly observable as "Not verifiable".`,
     }
   };
 
-  rawParsed = await executeSingleOrTwoStage();
+  const runWithServerSnapshot = async (model: string, snapshot: SiteSnapshot) => {
+    groundingSources = [{ title: `Live Server Inspection — ${snapshot.finalUrl}`, uri: snapshot.finalUrl }];
+    emitStage('building', 'Synthesizing structured audit report from live page telemetry...');
+
+    const response = await ai.models.generateContent({
+      model,
+      contents: `Analyze this LIVE server-side HTTP, header, robots.txt, sitemap, and HTML inspection snapshot for ${targetUrl} (Target Country: ${
+        targetCountry || 'Global'
+      }, Audit Date: ${today})${competitorUrl ? `, Competitor context: ${competitorUrl}` : ''}.
+Return ONLY valid JSON matching the exact schema. Base findings strictly on this observed snapshot; mark anything not observable (e.g. search engine backlink counts or CrUX field telemetry) as "Not verifiable".
+
+LIVE SNAPSHOT:
+${JSON.stringify(snapshot, null, 2)}`,
+      config: {
+        systemInstruction: AUDIT_SYSTEM_INSTRUCTION,
+        ...(model === MODEL_AUDIT ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } } : {}),
+        responseMimeType: 'application/json',
+        responseSchema: auditResponseSchema,
+      },
+    });
+    return parseJsonSafely(response.text);
+  };
+
+  let cachedSnapshot: SiteSnapshot | null = null;
+  const getSnapshot = async () => {
+    if (!cachedSnapshot) {
+      emitStage('reading', `Inspecting live HTML, headers, robots.txt & sitemap for ${targetUrl}...`);
+      cachedSnapshot = await fetchServerSideSiteSnapshot(targetUrl);
+    }
+    return cachedSnapshot;
+  };
+
+  const executeStrategyCascade = async (): Promise<Record<string, unknown> | null> => {
+    emitStage('reading', `Reading live page content for ${targetUrl}...`);
+
+    const strategies: Array<{ name: string; run: () => Promise<Record<string, unknown> | null>; delayBeforeMs?: number }> = [
+      { name: 'hydrogen+url+search', run: () => runWithTools(MODEL_AUDIT, [{ urlContext: {} }, { googleSearch: {} }], true) },
+      { name: 'hydrogen+url', run: () => runWithTools(MODEL_AUDIT, [{ urlContext: {} }], true) },
+      { name: 'flash-lite+url+search', run: () => runWithTools('gemini-3.1-flash-lite', [{ urlContext: {} }, { googleSearch: {} }], false) },
+      { name: 'flash-lite+url', run: () => runWithTools('gemini-3.1-flash-lite', [{ urlContext: {} }], false) },
+      { name: 'flash-lite+snapshot', run: async () => runWithServerSnapshot('gemini-3.1-flash-lite', await getSnapshot()) },
+      { name: 'hydrogen+snapshot', run: async () => runWithServerSnapshot(MODEL_AUDIT, await getSnapshot()), delayBeforeMs: 500 },
+      { name: 'flash-lite+snapshot-retry', run: async () => runWithServerSnapshot('gemini-3.1-flash-lite', await getSnapshot()), delayBeforeMs: 1200 },
+    ];
+
+    let lastError: unknown;
+    for (const strategy of strategies) {
+      try {
+        if (strategy.delayBeforeMs) {
+          await sleep(strategy.delayBeforeMs);
+        }
+        const result = await strategy.run();
+        if (result) return result;
+      } catch (err) {
+        lastError = err;
+        console.warn(`[audit strategy ${strategy.name} failed]`, (err as { status?: number })?.status || '', (err as Error)?.message?.slice(0, 180));
+        const errCode = (err as { errorCode?: string })?.errorCode;
+        if (errCode === 'UNREACHABLE' || errCode === 'API_KEY_ERROR') {
+          throw err;
+        }
+        if (isQuotaOrModelUnavailable(err) || isCombinedToolSchemaError(err)) {
+          continue;
+        }
+        throw err;
+      }
+    }
+    if (lastError) throw lastError;
+    return null;
+  };
+
+  let rawParsed = await executeStrategyCascade();
   let validated = validateAndNormalizeAudit(rawParsed, targetUrl, targetCountry, competitorUrl, groundingSources);
 
   // Retry once on malformed JSON or incomplete schema validation (per Section 1)
   if (!validated) {
     emitStage('building', 'Re-validating audit schema structure...');
-    rawParsed = await executeSingleOrTwoStage();
+    rawParsed = await executeStrategyCascade();
     validated = validateAndNormalizeAudit(rawParsed, targetUrl, targetCountry, competitorUrl, groundingSources);
   }
 
@@ -767,78 +1030,60 @@ async function runCompetitorBenchmark(
   targetCountry: string
 ) {
   const prompt = `Compare competitor ${competitorUrl} against ${primaryUrl} for market "${targetCountry || 'Global'}".
-Use URL Context and Google Search grounding to inspect ${competitorUrl} and score it across overall, seo, content, keywords, technical, and aiSearch (0-100).
+Inspect ${competitorUrl} and score it across overall, seo, content, keywords, technical, and aiSearch (0-100).
 Identify keyGaps (where ${primaryUrl} lags behind ${competitorUrl}) and competitorAdvantages (strengths observed on ${competitorUrl}). Only report observable signals.`;
+
+  const parseCompetitor = (text: string | undefined) => {
+    const parsed = parseJsonSafely(text);
+    if (!parsed || !parsed.scores) return undefined;
+    const s = parsed.scores as Record<string, unknown>;
+    return {
+      competitorUrl,
+      summary: String(parsed.summary || ''),
+      scores: {
+        overall: clampScore(s.overall),
+        seo: clampScore(s.seo),
+        content: clampScore(s.content),
+        keywords: clampScore(s.keywords),
+        technical: clampScore(s.technical),
+        aiSearch: clampScore(s.aiSearch),
+      },
+      keyGaps: Array.isArray(parsed.keyGaps) ? parsed.keyGaps.map(String) : [],
+      competitorAdvantages: Array.isArray(parsed.competitorAdvantages) ? parsed.competitorAdvantages.map(String) : [],
+    };
+  };
 
   try {
     const response = await ai.models.generateContent({
       model: MODEL_LIGHT,
       contents: prompt,
       config: {
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
         tools: [{ urlContext: {} }, { googleSearch: {} }],
         responseMimeType: 'application/json',
         responseSchema: competitorResponseSchema,
       },
     });
-    const parsed = parseJsonSafely(response.text);
-    if (parsed && parsed.scores) {
-      const s = parsed.scores as Record<string, unknown>;
-      return {
-        competitorUrl,
-        summary: String(parsed.summary || ''),
-        scores: {
-          overall: clampScore(s.overall),
-          seo: clampScore(s.seo),
-          content: clampScore(s.content),
-          keywords: clampScore(s.keywords),
-          technical: clampScore(s.technical),
-          aiSearch: clampScore(s.aiSearch),
-        },
-        keyGaps: Array.isArray(parsed.keyGaps) ? parsed.keyGaps.map(String) : [],
-        competitorAdvantages: Array.isArray(parsed.competitorAdvantages) ? parsed.competitorAdvantages.map(String) : [],
-      };
-    }
+    const parsed = parseCompetitor(response.text);
+    if (parsed) return parsed;
   } catch {
-    // Fallback two-step with gemini-2.5-flash if combined tools+schema is rejected
-    try {
-      const research = await ai.models.generateContent({
-        model: MODEL_LIGHT,
-        contents: prompt,
-        config: {
-          tools: [{ urlContext: {} }, { googleSearch: {} }],
-        },
-      });
-      const structured = await ai.models.generateContent({
-        model: MODEL_LIGHT,
-        contents: `Format this competitor comparison into JSON:\n\n${research.text || ''}`,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: competitorResponseSchema,
-        },
-      });
-      const parsed = parseJsonSafely(structured.text);
-      if (parsed && parsed.scores) {
-        const s = parsed.scores as Record<string, unknown>;
-        return {
-          competitorUrl,
-          summary: String(parsed.summary || ''),
-          scores: {
-            overall: clampScore(s.overall),
-            seo: clampScore(s.seo),
-            content: clampScore(s.content),
-            keywords: clampScore(s.keywords),
-            technical: clampScore(s.technical),
-            aiSearch: clampScore(s.aiSearch),
-          },
-          keyGaps: Array.isArray(parsed.keyGaps) ? parsed.keyGaps.map(String) : [],
-          competitorAdvantages: Array.isArray(parsed.competitorAdvantages) ? parsed.competitorAdvantages.map(String) : [],
-        };
-      }
-    } catch {
-      return undefined;
-    }
+    // Fallback to gemini-3.1-flash-lite with server snapshot
   }
-  return undefined;
+
+  try {
+    const snapshot = await fetchServerSideSiteSnapshot(competitorUrl);
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.1-flash-lite',
+      contents: `${prompt}\n\nCOMPETITOR LIVE SNAPSHOT:\n${JSON.stringify(snapshot, null, 2)}`,
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: competitorResponseSchema,
+      },
+    });
+    return parseCompetitor(response.text);
+  } catch {
+    return undefined;
+  }
 }
 
 async function createAppServer() {
@@ -892,6 +1137,7 @@ async function createAppServer() {
       { stage: 'aiSearch', message: 'Evaluating AI-search & GEO readiness across answer engines...', delayMs: 17000 },
     ];
     const timers: ReturnType<typeof setTimeout>[] = [];
+    let heartbeat: ReturnType<typeof setInterval> | null = null;
     if (wantsStream) {
       for (const item of stageQueue) {
         timers.push(
@@ -900,6 +1146,11 @@ async function createAppServer() {
           }, item.delayMs)
         );
       }
+      heartbeat = setInterval(() => {
+        if (!res.writableEnded) {
+          res.write(': keep-alive\n\n');
+        }
+      }, 6000);
     }
 
     try {
@@ -913,6 +1164,7 @@ async function createAppServer() {
       );
 
       for (const t of timers) clearTimeout(t);
+      if (heartbeat) clearInterval(heartbeat);
 
       if (normalizedCompetitor) {
         sendEvent('progress', {
@@ -933,6 +1185,7 @@ async function createAppServer() {
       }
     } catch (err) {
       for (const t of timers) clearTimeout(t);
+      if (heartbeat) clearInterval(heartbeat);
       const classified = classifyGeminiError(err);
       if (wantsStream) {
         sendEvent('error', classified);
@@ -952,13 +1205,25 @@ async function createAppServer() {
         return;
       }
       const ai = getGenAIClient();
-      const response = await ai.models.generateContent({
-        model: MODEL_LIGHT,
-        contents: `Create a concise, copy-ready implementation brief and code/copy snippet (e.g. HTML meta tags, JSON-LD schema, or llms.txt/copy improvement) for website ${
-          url || 'the audited site'
-        } addressing this issue: "${topic}". Context: "${context || ''}". Keep it practical and concise (under 220 words).`,
-      });
-      res.json({ snippet: response.text || '' });
+      const prompt = `Create a concise, copy-ready implementation brief and code/copy snippet (e.g. HTML meta tags, JSON-LD schema, or llms.txt/copy improvement) for website ${
+        url || 'the audited site'
+      } addressing this issue: "${topic}". Context: "${context || ''}". Keep it practical and concise (under 220 words).`;
+      let snippetText = '';
+      try {
+        const response = await ai.models.generateContent({
+          model: 'gemini-3.1-flash-lite',
+          contents: prompt,
+        });
+        snippetText = response.text || '';
+      } catch {
+        const fallbackResponse = await ai.models.generateContent({
+          model: MODEL_LIGHT,
+          contents: prompt,
+          config: { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } },
+        });
+        snippetText = fallbackResponse.text || '';
+      }
+      res.json({ snippet: snippetText });
     } catch (err) {
       const classified = classifyGeminiError(err);
       res.status(classified.status).json(classified);

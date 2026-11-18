@@ -86,7 +86,7 @@ export async function runLiveAudit(
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
 
     let boundary = buffer.indexOf('\n\n');
     while (boundary !== -1) {
@@ -115,7 +115,7 @@ export async function runLiveAudit(
 }
 
 /**
- * Lighter task backed by gemini-2.5-flash on the server:
+ * Lighter task backed by gemini-3.1-flash-lite / gemini-4-hydrogen on the server:
  * Generates a ready-to-use implementation snippet for an action plan item.
  */
 export async function generateImplementationSnippet(
